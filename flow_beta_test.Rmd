@@ -1,0 +1,821 @@
+---
+title: "Spectral flow cytometry analysis"
+author: "Jingna Xue"
+date: "2024-11-19"
+output:
+  html_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+# Preface
+
+*Precaution: grammars not checked!*
+
+This script allows characterize and compare cellular profile from multiple tissue and/or different conditions in a high-dimensional format. The only pre-processing required by this script is,
+
+1)  to clean the dead cells and debris, and pre-gating on cell of interest to investigate, using popular interactive software, such as FlowJo;
+
+2)  to know of your panel, especially pre-determine the markers used as cell state (e.g. L/D dye), pre-gating (e.g. CD45), or cell type --- the markers you want to use for clustering.
+
+The samples used in this script are lungs and tumor (PyMT) from WT, Rag2 KO, and Rag2yc DKO (**special thanks to Hobin who share the data**) with a ILC staining panel. If you have more type of tissue of interest, e.g. spleen, or have less or more conditions/mouse strains, you will need to revise some parts of this script.
+
+Keypoint is...
+
+Don't be scared of coding. Most you need to try is ctrl+C and ctrl+V. Never delete any lines. And read the notes (both in- and outside the chunks).
+
+# I. Installation and Loading Packages
+
+## 1.1 Installation
+
+You will only need to run this chunk once (unless you delete any packages in any chances). While installation, you can either enter 'a' or 'y' to enable installing all updates (which I never do), or enter 'space' to skip all updates.
+
+```{r Installing_packages, message=FALSE, eval=FALSE}
+install.packages("Seurat")
+install.packages("ggplot2")
+install.packages("forstringr")
+install.packages("ggsci")
+install.packages("dplyr")
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("flowCore")
+BiocManager::install("flowViz")
+BiocManager::install("flowVS")
+BiocManager::install("flowAI")
+BiocManager::install("PeacoQC")
+
+
+if(!requireNamespace("devtools", quietly=TRUE))
+  install.packages("devtools")
+
+devtools::install_github('saeyslab/CytoNorm')
+devtools::install_github("immunogenomics/harmony")
+devtools::install_github("rprops/Phenoflow_package")
+# CytoExploreRData 
+devtools::install_github("DillonHammill/CytoExploreRData")
+# CytoExploreR 
+devtools::install_github("DillonHammill/CytoExploreR")
+
+```
+
+## 1.2 Loading packages
+
+You will need to load the packages every time you open the Rstudio (or after restarting the R). If you forget, you mostly will see the error "cannot find the xxx function".
+
+```{r Loading_packages, message=FALSE, eval=FALSE}
+library(flowCore)
+library(flowViz)
+library(flowVS)
+library(flowAI)
+library(PeacoQC)
+options(Seurat.object.assay.version = "v3")
+library(Seurat)
+library(harmony)
+library(ggplot2)
+library(ggsci)
+library(dplyr)
+library(Phenoflow)
+library(forstringr)
+library(CytoNorm)
+library(CytoExploreR)
+library(CytoExploreRData)
+```
+
+# II. Data Pre-processing
+
+## 2.1 Import cleaned FCS3.0 files
+
+This chunk is to import the FCS files you'd like to analyze. Make sure you drag all the files into the "Input" folder and the file names follow the requirements, i.e. Batch_Tissue_Condition000.fcs (e.g. Nov_Lung_WT010.fcs).
+
+```{r Import_FCS}
+fcs.dir <- file.path(getwd(), "Input")
+fcs_T <- read.flowSet(path=fcs.dir, pattern="_T_", transformation = FALSE, truncate_max_range = FALSE) # FlowSet object
+fcs_Lung <- read.flowSet(path=fcs.dir, pattern = "_Lung_", transformation = F, truncate_max_range = F)
+```
+
+The next step is to extract the panel information from the input files.
+
+If you exported all uncompensated parameters (e.g. FSC-H, SSC-H) or including some state markers (e.g. xxx-CD45, xxx-Zombie), go to **option A**.
+
+If you only exported the parameters/colors for clustering, go to **option B**.
+
+**\*Option A: Construct a dataframe of the panel information**
+
+```{r Panel_Info_A}
+fcs_colname <- colnames(fcs_Lung) # assumed that the panel used in lungs or tumor is the same
+antigen <- pData(parameters(fcs_Lung[[1]]))$desc
+
+panel_preview <- data.frame(fcs_colname, antigen, row.names = NULL) 
+panel_preview # display the table to determine the location of markers as state, type, or none
+```
+
+```{r Panel_Info_A}
+marker_class <- rep("none", ncol(fcs_Lung[[1]]))
+
+#markers that indicate "state" of a cell, such as PDL1 marker, or use it to indicate markers you won't use for clustering
+marker_state <- c(10,21,33) # type in the row number of markers as cell state
+marker_class[marker_state] <- "state"
+
+# markers that indicate surface markers, such as CD3, CD4, or markers that you do want to use for clustering
+marker_type <- c(9,11:13,15:20,22:32) # type in the row number of markers that you want to use for clustering
+marker_class[marker_type] <- "type" 
+
+marker_class <- factor(marker_class, levels=c("type", "state", "none"))
+
+panel <- data.frame(fcs_colname, antigen, marker_class, row.names = NULL)
+
+panel_list <- panel[marker_type,] # type in the row number of markers that you want to use for clustering
+panel_list$fcs_colname <- gsub("-| ",".",panel_list$fcs_colname)
+
+write.csv(panel_list,file="markers_to_cluster.csv")
+
+markerstotransform <- panel$fcs_colname[9,11:13,15:20,22:32] # type in the row number of markers that you want to use for clustering
+```
+
+**\*Option B: If you have only exported markers to be clustered**
+
+```{r Panel_Info_B}
+fcs_colname <- colnames(fcs_Lung)
+antigen <- pData(parameters(fcs_Lung[[1]]))$desc
+marker_type <- c(1:length(fcs_colname))
+
+panel <- data.frame(fcs_colname, antigen, row.names = NULL)
+panel_list <- data.frame(fcs_colname, antigen, row.names = NULL)
+panel_list$fcs_colname <- gsub("-| ",".",panel_list$fcs_colname)
+
+write.csv(panel_list,file="markers_to_cluster.csv")
+
+markerstotransform <- panel$fcs_colname
+```
+
+## 2.2 Transformation
+
+The first step after successful data import is transformation, similar as you might all do in the FlowJo. The transformation method used here is Arcsin.
+
+A critical step here is to determine the co-factor. The MFI histogram plots could be very different between tissue and each markers. The current setting is assigning a fixed cofactor to all the markers, but for different type of tissue, a different cofactor was chosen for better performance.
+
+```{r data_transformation, message=FALSE}
+
+l <- length(markerstotransform)
+
+cofactor_T <- rep(1200, l) # you can adjust the number if you'd like to try different cofactor
+cofactor_Lung <- rep(1000, l) # you can adjust the number if you'd like to try different cofactor
+
+fcs_T_trans <- transFlowVS(fcs_T, channels = markerstotransform, cofactor_T)
+fcs_Lung_trans <- transFlowVS(fcs_Lung, channels = markerstotransform, cofactor_Lung)
+```
+
+Once you finish the transformation, you can evaluate if you are satisfied with the chosen co-factor by running the chunk below. You will get 4 plots showing histogram before and after transformation (2 plots for tumor and 2 for lung).
+
+```{r Evaluate_the_cofactor_chosen}
+densityplot(~ `FJComp-FITC-A`, fcs_T) # `FJComp-FITC-A` could be replaced with . or any other `color` to evaluate all or other parameters
+densityplot(~ `FJComp-FITC-A`, fcs_T_trans)
+
+densityplot(~ `FJComp-FITC-A`, fcs_Lung)
+densityplot(~ `FJComp-FITC-A`, fcs_Lung_trans)
+```
+
+If you are satisfied with the transformation, you can move forward to the next chunk: exporting the transformed fcs file.
+
+If not, however, you will need to change the number in the first chunk of this session (i.e. cofactor_T \<- rep(1200,l)), and run the chunk one and two again, until you find your desired number.
+
+```{r Export_transformed_files}
+#Exporting transformed fcs files
+outdir <- file.path(getwd(), "Transformed FCS files") 
+write.flowSet(fcs_T_trans, outdir = outdir, filename = paste(fcs_T_trans@phenoData@data$name))
+write.flowSet(fcs_Lung_trans, outdir = outdir, filename = paste(fcs_Lung_trans@phenoData@data$name))
+write.flowSet(fcs_LN_trans, outdir = outdir, filename = paste(fcs_LN_trans@phenoData@data$name))
+#create a new directory with transformed FCS files
+```
+
+## 2.3 Quality control
+
+After you determine the cofactors and transform the data, then a quality control can be performed. The following chunk will go through the transformed fcs files (you just exported) and generate a new folder with all transformed files after quality control.
+
+```{r QC}
+ff.dir <- file.path(getwd(), "Transformed FCS files")
+ff_list <- list.files(path = ff.dir, pattern = ".fcs")
+
+for (i in ff_list){
+  ff.path <- paste(ff.dir,i,sep = "/")
+  ff <- read.FCS(ff.path, transformation = F, truncate_max_range = F)
+  PeacoQC(ff=ff, channels = markerstotransform, 
+          determine_good_cells = "all", 
+          save_fcs = T, plot = T, 
+          output_directory = "PeacoQC_FCS")
+}
+```
+
+**If you ran multiple batches and you'd like to analyze all of them, you can move forward to [2.4]{.underline} Normalization.**
+
+**Otherwise, you can jump into [2.5.1]{.underline} Export csv.**
+
+## \*2.4 Normalizing Batch Effects
+
+The following chunks show an example of normalizing two batches (A & B) of lung samples, without reference/batch control group, which means normalization will be applied to all samples based on overall features detected in all the samples. There are ways to normalize according to one group, let me know if you prefer that.
+
+**\*Some editing would be required if there are more batches to normalize.**
+
+```{r TrainingModel}
+fcs.dir <- file.path(getwd(), "PeacoQC_FCS/PeacoQC_results/fcs_files")
+files_batch_A <- list.files(path = fcs.dir,
+                         pattern = "A_Lung", # pattern should be consistent with file name
+                                             # you can change the pattern = "A_T" when you want to normalize tumor samples
+                         full.names = TRUE)
+files_batch_B <- list.files(path = fcs.dir,
+                         pattern = "B_Lung",
+                         full.names = TRUE)
+
+#If you have more batches...
+#files_batch_C <- list.files(path = fcs.dir,
+#                        pattern = "C_Lung",
+#                         full.names = TRUE)
+
+cellTypeChannels <- markerstotransform
+
+agg_batch_A <- AggregateFlowFrames(fileNames = files_batch_A,
+                                   cTotal = length(files_batch_A)*10000)
+agg_batch_B <- AggregateFlowFrames(fileNames = files_batch_B,
+                                   cTotal = length(files_batch_B)*10000)
+#If you have more batches...
+#agg_batch_C <- AggregateFlowFrames(fileNames = files_batch_C,
+#                                   cTotal = length(files_batch_C)*10000)
+
+model_lung_withoutControl <- CytoNorm.train(files = flowSet(agg_batch_A, agg_batch_B), # Includes all batches you want to normalize
+                                            labels = c("A", "B"), #labels should be consistent with your batch info.
+                                            channels = cellTypeChannels,
+                                            transformList = NULL,
+                                            normMethod.train = QuantileNorm.train,
+                                            normParams = list(nQ = 101, goal = "mean"),
+                                            seed = 1,
+                                            verbose = TRUE,
+                                            plot = TRUE,
+                                            FlowSOM.params = list(nCells = 1e+05, 
+                                                                  xdim = 10, ydim = 10, 
+                                                                  nClus = 10, 
+                                                                  scale = FALSE))
+# Some visulization of the training model
+CVs1 <- testCV(fsom = model_lung_withoutControl$fsom, 
+               cluster_values = 3:20, plot = FALSE)
+
+PlotOverviewCV(fsom = model_lung_withoutControl$fsom, cv_res = CVs1,
+               show_cv = 0.8, max_cv = 1.5)
+```
+
+Once you have the training model, you can then apply the normalization to your batches.
+
+```{r Normalizing, message=FALSE}
+CytoNorm.normalize(model = model_lung_withoutControl,
+                   files = c(files_batch_A, files_batch_B), # Includes all batches you want to normalize
+                   labels = c(rep("A", length(files_batch_A)),
+                              rep("B", length(files_batch_B))), #labels should be consistent with your batch info.
+                   transformList = NULL,
+                   verbose = TRUE,
+                   prefix = "",
+                   transformList.reverse = NULL,
+                   normMethod.normalize = QuantileNorm.normalize,
+                   outputDir = "./Norm_data")
+```
+
+Then, you can visualize and evaluate the normalization using the same method as evaluating transformation.
+
+```{r Evaluating}
+fcs.dir <- file.path(getwd(), "Norm_data")
+fcs_Lung_norm <- read.flowSet(path = fcs.dir, pattern = ".fcs",
+                            transformation = F,
+                            truncate_max_range = F)
+
+densityplot(~ `FJComp-FITC-A`, fcs_Lung_trans)
+densityplot(~ `FJComp-FITC-A`, fcs_norm)
+```
+
+Once you are satisfied with the normalization, you can move forward to [**2.5.2**]{.underline} **Export csv**.
+
+## 2.5 Convert FCS files to CSV files
+
+### 2.5.1 Export csv after QC (without normalization)
+
+```{r Convert_wo_norm}
+# Convert FCS file to CSV file
+ff.dir <- file.path(getwd(), "PeacoQC_FCS/PeacoQC_results/fcs_files")
+ff_list <- list.files(path = ff.dir, pattern = ".fcs")
+
+for (i in ff_list){
+  ff.path <- file.path(ff.dir,i)
+  ff <- read.FCS(ff.path, transformation = F, truncate_max_range = F)
+  filename_i <- substr(i, 1, nchar(i)-7)
+  locations <- paste("./raw_csv/", filename_i, sep = "")
+  export_csv(ff, location = locations)
+}
+# one weird thing -- it generates csv files but also a empty folder
+# manually remove the empty folders before proceeding to the next step
+```
+
+### 2.5.2 Export csv after normalization
+
+```{r Convert_w_norm}
+# Convert FCS file to CSV file
+ff.dir <- file.path(getwd(), "Norm_data")
+ff_list <- list.files(path = ff.dir, pattern = ".fcs")
+
+for (i in ff_list){
+  ff.path <- file.path(ff.dir,i)
+  ff <- read.FCS(ff.path, transformation = F, truncate_max_range = F)
+  filename_i <- substr(i, 1, nchar(i)-7)
+  locations <- paste("./raw_csv/", filename_i, sep = "")
+  export_csv(ff, location = locations)
+}
+# one weird thing -- it generates csv files but also a empty folder
+# manually remove the empty folders before proceeding to the next step
+```
+
+# III. Cluster and Integration
+
+## **3.1 Import csv files**
+
+Finally, we have moved to moment of truth (not yet). In the following chunks, we will import the csv files and covert them to Seurat objects.
+
+```{r Import_csv, message=FALSE}
+csv.dir<- file.path(getwd(), "raw_csv")
+csv.list <- list.files(path = csv.dir, pattern = "*.csv")
+#panel_list <- read.csv("markers_to_cluster.csv")[,2:3]
+
+# build in function for replace fluo name
+label_fluo_markers <- function(df, panel_info){
+  for(i in 1:length(colnames(df))){
+    for(x in 1:length(panel_info[,1])){
+      if (colnames(df)[i] == panel_info[x,1]){
+        colnames(df)[i] <- gsub(panel_info[x,1], panel_info[x,2], colnames(df)[i])
+      }
+    }  
+  }
+  df
+}
+
+for (i in csv.list){
+  csv_name_i <- substr(i, 1, nchar(i)-4)
+  #print(csv_name_i)
+  assign(csv_name_i, read.csv(paste(csv.dir,"/",i,sep=""))[,-1] %>% label_fluo_markers(panel_list))
+}
+
+```
+
+## **3.2 Create Seurat Object**
+
+```{r Create_seurat_objects, message=FALSE, error=FALSE}
+
+for(i in csv.list){
+  sample_i <- substr(i, 1, nchar(i)-4)
+  batch_i <- sub("_.*", "", sample_i)
+  tissue_i <- gsub(".*_(.+)_.*", "\\1", sample_i)
+  rep_i <- sub(".*_", "", sample_i)
+  group_i <- substr(rep_i, 1, nchar(rep_i)-3)
+  df_i <- get(sample_i)
+  df_i <- df_i[,marker_type]
+  # Only keep the parameters needed for clustering and generating the UMAP
+  rownames(df_i) <- paste0(sample_i, "_", rownames(df_i)) # Name each cell
+  options(Seurat.object.assay.version = "v3")
+  assign(sample_i, CreateSeuratObject(counts = t(df_i)) %>% AddMetaData(metadata = sample_i, col.name = "sample_name") %>% AddMetaData(metadata = batch_i, col.name = "Batch") %>% AddMetaData(metadata = tissue_i, col.name = "Tissue") %>% AddMetaData(metadata = group_i, col.name = "Group") %>% AddMetaData(metadata = rep_i, col.name = "Replicates"))
+  
+}
+```
+
+## **3.3 Merge all samples and downsample**
+
+Once we have created the Seurat objects, we can merge and downsample the data. Each type of tissue is downsized to a certain number. Let's say if you only need to analyze one type of tissue (e.g. lungs), you can skip this section and jump in to [**3.4.1 and skip 3.4.2 as well**]{.underline}.
+
+The major reason of downsampling here is due to the limitation of computer memory. This step may not be necessary after the workstation is set up (have faith in the 64G ram).
+
+\*if you are confident with your computer reading ability, you can **skip this portion** and move forward to [**3.3.1**]{.underline} instead.
+
+```{r Merge_S4Objects, message=FALSE}
+comb_T <- merge(A_T_DKO026, c(A_T_DKO034, A_T_DKO047, A_T_Rag2KO025, A_T_Rag2KO027, A_T_Rag2KO036, A_T_WT010, A_T_WT020, A_T_WT040))
+Idents(comb_T) <- 'Replicates'
+comb_T <- subset(comb_T, downsample = 30000)
+
+comb_Lung <- merge(A_Lung_DKO026, c(A_Lung_DKO034, A_Lung_DKO045, A_Lung_Rag2KO025, A_Lung_Rag2KO027, A_Lung_Rag2KO036, A_Lung_WT010, A_Lung_WT020, A_Lung_WT030))
+Idents(comb_Lung) <- 'Replicates'
+comb_Lung <- subset(comb_Lung, downsample = 20000)
+
+remove(A_T_DKO026,A_T_DKO034, A_T_DKO047, A_T_Rag2KO025, A_T_Rag2KO027, A_T_Rag2KO036, A_T_WT010, A_T_WT020, A_T_WT040, A_Lung_DKO026, A_Lung_DKO034, A_Lung_DKO045, A_Lung_Rag2KO025, A_Lung_Rag2KO027, A_Lung_Rag2KO036, A_Lung_WT010, A_Lung_WT020, A_Lung_WT030)
+
+comb_all <- merge(comb_T, comb_Lung)
+```
+
+### \*3.3.1 Merge all samples wo downsampling
+
+```{r Merge_wo_ds, message=FALSE}
+comb_all <- merge(A_T_DKO026, c(A_T_DKO034, A_T_DKO047, A_T_Rag2KO025, A_T_Rag2KO027, A_T_Rag2KO036, A_T_WT010, A_T_WT020, A_T_WT040, A_Lung_DKO026, A_Lung_DKO034, A_Lung_DKO045, A_Lung_Rag2KO025, A_Lung_Rag2KO027, A_Lung_Rag2KO036, A_Lung_WT010, A_Lung_WT020, A_Lung_WT030))
+```
+
+## 3.4 Clustering
+
+### [**\*Optional: Run this chunk only if you only have one type of tissue to analyze.**]{.underline}
+
+Otherwise, please skip this chunk below and move forward to the next one.
+
+```{r optional}
+comb_all <- comb_Lung
+```
+
+### 3.4.1 Before Integration
+
+Firstly, we can run UMAP and Clustering before integrate the tissue variance.
+
+```{r PCA}
+comb_all <- ScaleData(comb_all)
+comb_all <- RunPCA(comb_all, feature = rownames(comb_all), approx = F)
+ElbowPlot(comb_all)
+```
+
+Based on the ElbowPlot, determine an optimal dims for the following functions (FindNeighbors and RunUMAP).
+
+A ranking of principle components based on the percentage of variance explained by each one ([`ElbowPlot()`](https://satijalab.org/seurat/reference/elbowplot) function). In this example, we can observe an 'elbow' around PC9-10, suggesting that the majority of true signal is captured in the first 10 PCs.
+
+![](images/elbow_plot-1.png){width="335"}
+
+In our examples, I chose PC15.
+
+To yield better/more accurate output, another parameter you can play with is the resolution in FindClusters.
+
+**Resolution:** Value of the resolution parameter, use a value above (below) 1.0 if you want to obtain a larger (smaller) number of communities.
+
+In our examples, I chose 0.8.
+
+```{r before_integration}
+
+comb_all_unintegrated <- FindNeighbors(comb_all, dims = 1:15, reduction = "pca")
+comb_all_unintegrated <- FindClusters(comb_all_unintegrated, resolution = 0.8)
+comb_all_unintegrated <- RunUMAP(comb_all_unintegrated, dims = 1:15, reduction = "pca", reduction.name = "umap")
+
+```
+
+#### **Visualization and export**
+
+The following codes visualize and export the clusters and features of the initial analysis without integration. By inputting different metadata in **"group.by"** and **"split.by"**, you can change the way of data presentation.
+
+You can also change the visualization, such as color (**col =** c(xxx)), and size of the output (**height =** xx, **width =** xx)
+
+```{r export_charts_1}
+# Subset only "lung" samples; group.by "seurat_clusters"; split/compare umaps by "Group"
+DimPlot(subset(comb_all_unintegrated, subset = Tissue == "Lung"), reduction = "umap", group.by = "seurat_clusters", split.by = "Group", shuffle = T, pt.size = 0.01, raster = F, cols = pal_ucscgb("default", alpha = 0.7)(26))
+ggsave("umap_Lung_splited.png", path = "./Output", height = 5, width = 10)
+
+# Feature dot plots showing ALL marker expression of lung on the umap
+FeaturePlot(subset(comb_all_unintegrated, subset = Tissue == "Lung"), features = rownames(comb_all_unintegrated), ncol = 4, cols = c("lightgrey", "purple3"), min.cutoff = "q1", raster = F)
+ggsave("feature_Lung_unintegrated.png", path = "./Output", height = 15, width = 12)
+
+```
+
+[**\*Skip the export_charts_2 if you only have one type of tissue analyzing.**]{.underline}
+
+```{r export_charts_2}
+# Subset only "tumor" samples; group.by "seurat_clusters"; split/compare umaps by "Group"
+DimPlot(subset(comb_all_unintegrated, subset = Tissue == 'T'), reduction = "umap", group.by = "seurat_clusters", split.by = "Group", shuffle = T, pt.size = 0.01, raster = F, cols = pal_ucscgb("default", alpha = 0.7)(26))
+ggsave("umap_T_unintegrated.png", path = "./Output", height = 5, width = 16)
+
+# Feature dot plots showing ALL marker expression of tumor on the umap
+FeaturePlot(subset(comb_all_unintegrated, subset = Tissue == "T"), features = rownames(comb_all_unintegrated), ncol = 4, cols = c("lightgrey", "purple3"), min.cutoff = "q1", raster = F)
+ggsave("feature_T_unintegrated.png", path = "./Output", height = 15, width = 12)
+
+
+# Plotting all samples; group.by "seurat_clusters"; split/compare umaps by "Tissue"
+# This plot shows the variation between tissue types
+DimPlot(comb_all_unintegrated, reduction = "umap", group.by = "seurat_clusters", split.by = "Tissue", shuffle = T, pt.size = 0.01, raster = F, cols = pal_ucscgb("default", alpha = 0.7)(26), label = T)
+ggsave("umap_split_tissue_unintegrated.png", path = "./Output", height = 5, width = 10)
+```
+
+### 3.4.2 Integration
+
+**\*Skip 3.4.2 if you only have one type of tissue to analyze.**
+
+In most cases, there will be variations between tissue, majorly caused by different expression pattern of some markers. Therefore, to yield a neat plot and have a better comparison, integration will be helpful.
+
+```{r Integration}
+#Harmony Integration (works more correctly)
+comb_harmony <- RunHarmony(object = comb_all, group.by.vars = 'Tissue', group.by = 'Group')
+comb_harmony <- RunUMAP(comb_harmony, reduction = "harmony", dims = 1:15)
+comb_harmony <- FindNeighbors(comb_harmony, dims = 1:15, reduction = "harmony")
+comb_harmony <- FindClusters(comb_harmony, resolution = 0.8)
+```
+
+#### **Visualization and export**
+
+```{r export_charts_3}
+DimPlot(subset(comb_harmony, subset = Tissue == 'T'), reduction = "umap", group.by = "seurat_clusters", split.by = "Group", shuffle = T, pt.size = 0.01, raster = F, cols = pal_ucscgb("default", alpha = 0.7)(26))
+ggsave("umap_T_harmony_0.8.png", path = "./Output", height = 5, width = 16)
+
+FeaturePlot(subset(comb_harmony, subset = Tissue == "T"), features = rownames(comb_harmony), ncol = 4, cols = c("lightgrey", "purple3"), min.cutoff = "q1", raster = F)
+ggsave("feature_T_harmony_0.8.png", path = "./Output", height = 15, width = 12)
+
+DimPlot(subset(comb_harmony, subset = Tissue == "Lung"), reduction = "umap", group.by = "seurat_clusters", split.by = "Group", shuffle = T, pt.size = 0.01, raster = F, cols = pal_ucscgb("default", alpha = 0.7)(26))
+ggsave("umap_Lung_harmony_0.8.png", path = "./Output", height = 5, width = 16)
+
+FeaturePlot(subset(comb_harmony, subset = Tissue == "Lung"), features = rownames(comb_harmony), ncol = 4, cols = c("lightgrey", "purple3"), min.cutoff = "q1", raster = F)
+ggsave("feature_Lung_harmony_0.8.png", path = "./Output", height = 15, width = 12)
+
+DimPlot(comb_harmony, reduction = "umap", group.by = "seurat_clusters", split.by = "Tissue", shuffle = T, pt.size = 0.01, raster = F, cols = pal_ucscgb("default", alpha = 0.7)(26), label = T)
+ggsave("umap_tissue_split_harmony.png", path = "./Output", height = 5, width = 10)
+```
+
+## 3.5 Define clusters, rename, and split/combine
+
+### [**\*Optional: Run this chunk only if you only have one type of tissue to analyze.**]{.underline}
+
+Otherwise, please skip this chunk below and move forward to the next one.
+
+```{r optional}
+comb_harmony <- comb_all_unintegrated
+```
+
+### 3.5.1 Assign cluster names
+
+Based on the UMAPs and FeaturePlots generated earlier, it is time to identify each population, or at least, label them with critical markers.
+
+You will need to generate a table contains information below,
+
+| Cluster | Cluster_name  |
+|---------|---------------|
+| 0       | Myeloid cells |
+| 1       | NK cells      |
+| 2       | NK cells      |
+| ...     |               |
+
+You can do this in excel and exported as CSV format, and import it into the R. Or, you can also directly generate the data.frame in the R.
+
+**Note:** assign the clusters with the same name if you want to merge any clusters and you think they are the same type of pops and unable to distinguish with current markers.
+
+#### Option 1: make the table in excel and save it as "cluster_name.csv" under the same folder with your R project, then import into R
+
+```{r cluster_name_1}
+cluster_name <- read.csv("cluster_name.csv")
+```
+
+#### Option 2: make a data.frame in R
+
+```{r cluster_name_2}
+# For cluster that cannot be identified, I named them just using numbers
+cluster_name <- data.frame(Cluster = c(0:18), 
+                           Cluster_name = c("Myeloid cels",
+                                            "NK cells",
+                                            "NK cells",
+                                            "B",
+                                            "Myeloid cels",
+                                            "CD4 T",
+                                            "Myeloid cels",
+                                            "PD-1+ CD8 T",
+                                            "CD127+ CD8 T",
+                                            "NKT-1",
+                                            "Myeloid cels",
+                                            "Myeloid cels",
+                                            "1",
+                                            "ILC2",
+                                            "2",
+                                            "Myeloid cels",
+                                            "NKT-2",
+                                            "3",
+                                            "4"),
+                           row.names = NULL)
+```
+
+#### Assign names and add to metadata
+
+```{r assign_names}
+cluster_names <- cluster_name[,2]
+names(cluster_names) <- levels(comb_harmony)
+comb_harmony <- RenameIdents(comb_harmony, cluster_names)
+comb_harmony$clusters <- Idents(comb_harmony)
+```
+
+#### Export UMAPs with labels
+
+```{r export_labels}
+DimPlot(comb_harmony, reduction = "umap", group.by = "seurat_clusters", shuffle = T, pt.size = 0.01, raster = F, cols = pal_ucscgb("default", alpha = 0.7)(26), label = T, label.size = 4, label.box = T)
+ggsave("umap_harmony_labelled.png", path = "./Output", height = 5, width = 7)
+```
+
+### 3.5.2 Furthur split and cluster
+
+Sometimes, when there are some dominant populations, small populations tend not to separate properly. This issue may be resolved by involving as many as cells you have, but it won't be practical on personal laptops. (Waiting for the work station set-up)
+
+Currently, if you find some small subpopulations are not separated clearly, you can consider the following steps.
+
+```{r sub_split, message=F}
+#Based on the overall clustering, divided them into groups of interest
+
+Idents(comb_harmony) <- "seurat_clusters"
+
+# Enter the cluster numbers based on the cluster_name table
+T_B_cells <- c(3,5,7,8,9,16)
+NK_ILCs <- c(1,2,12,13,14,18)
+Myeloid <- c(0,4,6,10,11,15)
+outlier <- c(17)
+
+TB_cells_comb <- subset(comb_harmony, idents = T_B_cells)
+TB_cells_comb <- RunHarmony(object = TB_cells_comb, group1 = 'Tissue', group.by = 'Group') %>% RunUMAP(reduction = "harmony", dims = 1:15) %>% FindNeighbors(dims = 1:15, reduction = "harmony") %>% FindClusters(resolution = 0.5)
+
+NK_ILCs_comb <- subset(comb_harmony, idents = NK_ILCs)
+NK_ILCs_comb <- RunHarmony(object = NK_ILCs_comb, group1 = 'Tissue', group.by = 'Group') %>% RunUMAP(reduction = "harmony", dims = 1:15) %>% FindNeighbors(dims = 1:15, reduction = "harmony") %>% FindClusters(resolution = 0.5)
+
+```
+
+#### **Export T cell panel plots**
+
+```{r export_TB}
+DimPlot(subset(TB_cells_comb, subset = Tissue == "T"), reduction = "umap", group.by = "seurat_clusters", split.by = "Group", shuffle = T, pt.size = 0.01, raster = F, cols = pal_ucscgb("default", alpha = 0.7)(26), label = T)
+ggsave("umap_T_TB_splited.png", path = "./Output", height = 5, width = 16)
+
+FeaturePlot(subset(TB_cells_comb, subset = Tissue == "T"), features = rownames(comb_harmony), ncol = 4, cols = c("lightgrey", "purple3"), min.cutoff = "q1", raster = F)
+ggsave("feature_T_TB_splited.png", path = "./Output", height = 15, width = 12)
+
+DimPlot(subset(TB_cells_comb, subset = Tissue == "Lung"), reduction = "umap", group.by = "seurat_clusters", split.by = "Group", shuffle = T, pt.size = 0.01, raster = F, cols = pal_ucscgb("default", alpha = 0.7)(26), label = T)
+ggsave("umap_lung_TB_splited.png", path = "./Output", height = 5, width = 16)
+
+FeaturePlot(subset(TB_cells_comb, subset = Tissue == "Lung"), features = rownames(comb_harmony), ncol = 4, cols = c("lightgrey", "purple3"), min.cutoff = "q1", raster = F)
+ggsave("feature_lung_TB_splited.png", path = "./Output", height = 15, width = 12)
+```
+
+#### **Export ILC and NK cell panel plots**
+
+```{r}
+DimPlot(subset(NK_ILCs_comb, subset = Tissue == "T"), reduction = "umap", group.by = "seurat_clusters", split.by = "Group", shuffle = T, pt.size = 0.01, raster = F, cols = pal_ucscgb("default", alpha = 0.7)(26), label = T)
+ggsave("umap_T_ILC_splited.png", path = "./Output", height = 5, width = 16)
+
+FeaturePlot(subset(NK_ILCs_comb, subset = Tissue == "T"), features = rownames(comb_harmony), ncol = 4, cols = c("lightgrey", "purple3"), min.cutoff = "q1", raster = F)
+ggsave("feature_T_ILC_splited.png", path = "./Output", height = 15, width = 12)
+
+DimPlot(subset(NK_ILCs_comb, subset = Tissue == "Lung"), reduction = "umap", group.by = "seurat_clusters", split.by = "Group", shuffle = T, pt.size = 0.01, raster = F, cols = pal_ucscgb("default", alpha = 0.7)(26), label = T)
+ggsave("umap_lung_ILC_splited.png", path = "./Output", height = 5, width = 16)
+
+FeaturePlot(subset(NK_ILCs_comb, subset = Tissue == "Lung"), features = rownames(comb_harmony), ncol = 4, cols = c("lightgrey", "purple3"), min.cutoff = "q1", raster = F)
+ggsave("feature_lung_ILC_splited.png", path = "./Output", height = 15, width = 12)
+```
+
+**Using the initial exported plots, name the clusters based on features plots.**
+
+#### Option 1: make the table in excel and save it as "cluster_name.csv" under the same folder with your R project, then import into R
+
+| Cluster_TB | TB_ids      | Cluster_NK_ILC | NK_ILC_ids |
+|------------|-------------|----------------|------------|
+| 0          | PD-1+ CD8 T | 0              | DP NK      |
+| 1          | B           | 1              | DP NK      |
+| ...        | ...         | ...            | ...        |
+
+```{r cluster_ids_1}
+cluster_ids <- read.csv("cluster_ids.csv")
+```
+
+#### Option 2: make a data.frame in R
+
+```{r cluster_ids_2}
+# For cluster that cannot be identified, I named them just using numbers
+cluster_ids <- data.frame(Cluster_TB = c(0:10), 
+                          TB_ids = c("PD1+ CD8 T",
+                                     "B",
+                                     "B",
+                                     "PD-1+ NKT",
+                                     "CD127+ CD8 T",
+                                     "CD127+ CD4 T",
+                                     "KLRG1+4-1BB+CD25+ CD4 T",
+                                     "NKT",
+                                     "CD117+CD49a B",
+                                     "Ki67+ CD8 T",
+                                     ""),
+                          Cluster_NK_ILC = c(0:10),
+                          NK_ILC_ids = c("DP NK",
+                                         "DP NK",
+                                         "DP NK",
+                                         "4-1BB+ DP NK",
+                                         "KLRG1+4-1BB+ DP NK",
+                                         "CD117+ NK",
+                                         "NKT-1",
+                                         "Ki67+ DP NK",
+                                         "NKT-2",
+                                         "ILC2",
+                                         "KLRG1+NK1.1+NKp46-"),
+                          row.names = NULL)
+```
+
+#### Assign names and add to metadata
+
+```{r assign_subnames}
+# assign the cluster_ids following cluster numbers
+cluster_ids_TB <- cluster_ids[1:10,2] #[row, column] the row number must match the number of                                                      clusters you have in the object
+cluster_ids_ILC <- cluster_ids[1:11,4]
+
+names(cluster_ids_TB) <- levels(TB_cells_comb)
+TB_cells_comb <- RenameIdents(TB_cells_comb, cluster_ids_TB)
+TB_cells_comb$clusters <- Idents(TB_cells_comb)
+
+names(cluster_ids_ILC) <- levels(NK_ILCs_comb)
+NK_ILCs_comb <- RenameIdents(NK_ILCs_comb, cluster_ids_ILC)
+NK_ILCs_comb$clusters <- Idents(NK_ILCs_comb)
+```
+
+## 3.6 Additional Analysis
+
+### **3.6.1 Calculate cluster \# and %**
+
+#### 1) Overall cluster \# and %
+
+```{r cluster_perc}
+# Calculate all cells used across samples
+all_cells <- split(comb_harmony@meta.data, comb_harmony@meta.data$sample_name)
+all_cell_counts <- lapply(all_cells, function(x) length(x$orig.ident)) %>% data.frame(matrix(byrow = F)) %>% t()
+
+# Calculate # of each cluster
+all_clusters_l <- lapply(all_cells, function(x) {
+  x_cells <- unlist(lapply(split(x, x$clusters), nrow))
+  x_cells
+}) 
+all_clusters <- data.frame(matrix(unlist(all_clusters_l), nrow=length(all_clusters_l), 
+                                  byrow=TRUE))
+rownames(all_clusters) <- names(all_clusters_l)
+colnames(all_clusters) <- names(all_clusters_l[[1]])
+all_clusters$total <- all_cell_counts[1:length(all_cells),1]
+
+# Calculate % per cluster across samples
+all_cluster_freq <- apply(all_clusters[,colnames(all_clusters)],2,
+                     function(x) x/all_clusters[,"total"]*100) %>% data.frame()
+
+write.csv(all_cluster_freq, file = "all_cluster_freq.csv")
+```
+
+#### 2) Further clustered \# and % (skip this section if you did NOT run [3.5.2]{.underline})
+
+```{r subcluster_perc}
+
+# create # of clusters in T-cell plots
+TB_samples <- split(TB_cells_comb@meta.data, TB_cells_comb@meta.data$sample_name)
+TB_clusters_l <- lapply(TB_samples, function(x) {
+  x_cells <- unlist(lapply(split(x, x$clusters), nrow))
+  x_cells
+}) 
+TB_clusters <- data.frame(matrix(unlist(TB_clusters_l), nrow=length(TB_clusters_l), byrow=TRUE))
+rownames(TB_clusters) <- names(TB_clusters_l)
+colnames(TB_clusters) <- names(TB_clusters_l[[1]])
+TB_clusters$total <- all_cell_counts[1:length(all_cells),1]
+
+# create # of clusters in NK/ILC plots
+NK_ILCs_samples <- split(NK_ILCs_comb@meta.data, NK_ILCs_comb@meta.data$sample_name)
+NK_ILCs_clusters_l <- lapply(NK_ILCs_samples, function(x) {
+  x_cells <- unlist(lapply(split(x, x$clusters), nrow))
+  x_cells
+}) 
+NK_ILCs_clusters <- data.frame(matrix(unlist(NK_ILCs_clusters_l), 
+                                      nrow=length(NK_ILCs_clusters_l), 
+                                      byrow=TRUE))
+rownames(NK_ILCs_clusters) <- names(NK_ILCs_clusters_l)
+colnames(NK_ILCs_clusters) <- names(NK_ILCs_clusters_l[[1]])
+NK_ILCs_clusters$total <- all_cell_counts[1:length(all_cells),1]
+
+# create % of clusters
+TB_cluster_freq <- apply(TB_clusters[,colnames(TB_clusters)],2,
+                     function(x) x/TB_clusters[,"total"]*100) %>% data.frame()
+
+NK_ILCs_cluster_freq <- apply(NK_ILCs_clusters[,colnames(NK_ILCs_clusters)],2,
+                     function(x) x/NK_ILCs_clusters[,"total"]*100) %>% data.frame()
+
+write.csv(T_cluster_freq, file = "TB_cluster_freq.csv")
+write.csv(NK_ILCs_cluster_freq, file = "NK_ILCs_cluster_freq.csv")
+```
+
+This section allows export a csv file contains the frequency of each cluster/sub-clusters out of total cells used for clustering. **You can then use the csv file and make whatever charts you like in PRISM.**
+
+However, if you really like to make (challenge) the (yourself) charts (with) in (ugly) R (charts) as well, let me know. I will attach the code for using the ggplots.
+
+### 3.6.2 Expression level
+
+```{r}
+VlnPlot(comb_harmony, 
+        features = "PD-1", 
+        cols = c("lightblue2", "red3"), 
+        pt.size = 0.1) + RotatedAxis()
+ggsave("vlnplot_PD-1.png", dpi = 300, width = 5, height = 10)
+```
+
+**There are additional parameters that can be adjusted/included.**
+
+**split.by = "Group"** \# Include this if you want to compare between any groups.
+
+**idents = c("MedRC")** \# Use it if you only wants to show the marker expression of certain
+
+**features = c("PD-1", "LAG3")** \# Use c(), if you want to generate one plot with multiple vln charts.
+
+**pt.size = 0-1** \# You can set it to 0 if you do not want to show dot distribution.
+
+**+ RotatedAxis()** \# Remove this if you want the axis not to rotate.
+
+### 3.6.3 Other format of cluster features
+
+```{r}
+Idents(comb_harmony) <- "clusters"
+
+comb_diff.markers <- FindAllMarkers(comb_harmony, only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.25, test.use = "MAST")
+comb_diff.markers_top_7 <- comb_diff.markers %>% group_by(cluster) %>% top_n(n = 7, wt = avg_log2FC)
+
+DotPlot(comb_harmony, features = unique(comb_diff.markers_top_7$gene), col.min = 0, col.max = 5, dot.scale = 4) + RotatedAxis() + FontSize(8)
+ggsave("top7featurePlot_split.png", width = 20, height = 10, dpi = 600)
+```
